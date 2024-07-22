@@ -1,4 +1,4 @@
-from flask import Blueprint, current_app
+from flask import Blueprint, current_app, jsonify
 from tensorflow.keras.models import load_model
 import numpy as np
 import cv2
@@ -7,6 +7,7 @@ import logging
 import time
 import threading
 from queue import Queue, Empty
+from threading import Lock
 
 stream = Blueprint("stream", __name__)
 
@@ -50,6 +51,9 @@ except Exception as e:
 face_queue = Queue(maxsize=QUEUE_SIZE)
 body_queue = Queue(maxsize=QUEUE_SIZE)
 
+# List to store predictions
+predictions_list = []
+predictions_list_lock = Lock() # for thread safety
 
 def preprocess_image(frame, target_size=(224, 224)):
     rgb_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -95,6 +99,7 @@ def process_stream(stream_url, queue):
 
 
 def process_model_queue(queue, model, index_to_label, model_name):
+    global predictions_list
     batch = []
     while True:
         try:
@@ -106,7 +111,15 @@ def process_model_queue(queue, model, index_to_label, model_name):
                 predictions = predict_batch(batch, model, index_to_label)
                 end_time = time.time()
 
-                for pred in predictions:
+                with predictions_list_lock:
+                    for pred in predictions:
+                        prediction_info = {
+                            "model": model_name,
+                            "prediction": pred,
+                            "processing_time": end_time - start_time
+                        }
+                        predictions_list.append(prediction_info)
+                        
                     logger.info(
                         f"{model_name} prediction: {pred}, Time: {end_time - start_time:.4f} seconds"
                     )
@@ -118,15 +131,27 @@ def process_model_queue(queue, model, index_to_label, model_name):
                 predictions = predict_batch(batch, model, index_to_label)
                 end_time = time.time()
 
-                for pred in predictions:
-                    logger.info(
-                        f"{model_name} prediction: {pred}, Time: {end_time - start_time:.4f} seconds"
-                    )
+                with predictions_list_lock:                    
+                    for pred in predictions:
+                        prediction_info = {
+                            "model": model_name,
+                            "prediction": pred,
+                            "processing_time": end_time - start_time
+                        }
+                        predictions_list.append(prediction_info)
+                        
+                        logger.info(
+                            f"{model_name} prediction: {pred}, Time: {end_time - start_time:.4f} seconds"
+                        )
 
                 batch = []
 
 
 def start_streams():
+    # clear predictions list to only have latest batch from each camera
+    global predictions_list
+    predictions_list.clear()
+    
     face_stream_url = "http://192.168.2.175/stream"  # Adjust if needed
     body_stream_url = "http://192.168.2.176/stream"  # Adjust if needed
 
@@ -163,3 +188,8 @@ def get_stream_info():
         "queue_size": QUEUE_SIZE,
         "prediction_threshold": PREDICTION_THRESHOLD,
     }
+
+@stream.route("/predictions", methods=["GET"])
+def get_predictions():
+    global predictions_list
+    return jsonify(predictions_list)
